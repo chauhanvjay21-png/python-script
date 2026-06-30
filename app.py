@@ -1,16 +1,15 @@
-# app.py
-from flask import Flask, request, jsonify, render_template, send_from_directory
+from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 import json
 import os
 from datetime import datetime
 
 app = Flask(__name__)
-CORS(app)  # allow cross-origin requests from Blogger
+CORS(app)  # Allow any origin (registration sites, Blogger, etc.)
 
 DATA_FILE = 'registrations.json'
 
-# ------------------- JSON file helpers -------------------
+# ------------------- JSON helpers -------------------
 def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, 'r') as f:
@@ -38,8 +37,7 @@ def register():
 
     registrations = load_data()
 
-    # Auto-generate registration number
-    # Find max numeric part
+    # Auto‑generate registration number
     max_id = 0
     for reg in registrations:
         reg_no = reg.get('citizenRegNo', '')
@@ -54,7 +52,7 @@ def register():
     citizen_reg_no = f"CIT-{new_id:04d}"
 
     registration = {
-        'id': new_id,  # internal numeric ID for easier updates
+        'id': new_id,
         'citizenRegNo': citizen_reg_no,
         'fullName': data['fullName'].strip(),
         'state': data['state'].strip(),
@@ -70,8 +68,7 @@ def register():
 
 @app.route('/api/registrations', methods=['GET'])
 def get_all():
-    registrations = load_data()
-    return jsonify(registrations)
+    return jsonify(load_data())
 
 @app.route('/api/registrations/<int:reg_id>', methods=['PUT'])
 def update_registration(reg_id):
@@ -79,7 +76,6 @@ def update_registration(reg_id):
     for idx, reg in enumerate(registrations):
         if reg.get('id') == reg_id:
             updates = request.get_json()
-            # Update fields (cannot change ID/regNo)
             reg['fullName'] = updates.get('fullName', reg['fullName']).strip()
             reg['state'] = updates.get('state', reg['state']).strip()
             reg['district'] = updates.get('district', reg['district']).strip()
@@ -99,11 +95,12 @@ def delete_registration(reg_id):
     save_data(new_list)
     return jsonify({'message': 'Deleted'}), 200
 
-# ------------------- Developer Portal (frontend) -------------------
-@app.route('/')
-def portal():
-    return render_template('portal.html')
+# ------------------- (Optional) Portal served by Flask -------------------
+# If you prefer to host the portal on Flask instead of Blogger, uncomment:
+# @app.route('/')
+# def portal():
+#     return render_template('portal.html')
 
-# ------------------- Run -------------------
+# For PythonAnywhere, the app must be named 'app'
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=True)

@@ -1,29 +1,79 @@
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify
 from flask_cors import CORS
+import sqlite3
 import json
 import os
 from datetime import datetime
+from contextlib import closing
 
 app = Flask(__name__)
-CORS(app)  # Allow any origin (registration sites, Blogger, etc.)
+CORS(app)
 
-DATA_FILE = 'registrations.json'
+DATABASE = 'registrations.db'
+JSON_BACKUP = 'registrations.json'   # optional backup file
 
-# ------------------- JSON helpers -------------------
-def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'r') as f:
+# ------------------- Database helpers -------------------
+def get_db():
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row   # allows accessing columns by name
+    return conn
+
+def init_db():
+    """Create the table if it doesn't exist."""
+    with closing(get_db()) as db:
+        db.execute('''
+            CREATE TABLE IF NOT EXISTS citizens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                citizenRegNo TEXT UNIQUE NOT NULL,
+                fullName TEXT NOT NULL,
+                state TEXT NOT NULL,
+                district TEXT NOT NULL,
+                village TEXT NOT NULL,
+                phone TEXT UNIQUE NOT NULL,
+                createdAt TEXT NOT NULL
+            )
+        ''')
+        db.execute('CREATE INDEX IF NOT EXISTS idx_phone ON citizens(phone)')
+        db.commit()
+
+# ------------------- Migration from JSON (if file exists) -------------------
+def migrate_json_to_sqlite():
+    """Import existing JSON data into SQLite (if file exists and table is empty)."""
+    if not os.path.exists(JSON_BACKUP):
+        return
+
+    with closing(get_db()) as db:
+        # Check if table already has data
+        count = db.execute('SELECT COUNT(*) FROM citizens').fetchone()[0]
+        if count > 0:
+            return   # already migrated
+
+        with open(JSON_BACKUP, 'r') as f:
             try:
-                return json.load(f)
+                data = json.load(f)
             except:
-                return []
-    return []
+                return
 
-def save_data(data):
-    with open(DATA_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
+        for reg in data:
+            try:
+                db.execute('''
+                    INSERT INTO citizens (citizenRegNo, fullName, state, district, village, phone, createdAt)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    reg['citizenRegNo'],
+                    reg['fullName'],
+                    reg['state'],
+                    reg['district'],
+                    reg['village'],
+                    reg['phone'],
+                    reg.get('createdAt', datetime.utcnow().isoformat() + 'Z')
+                ))
+            except sqlite3.IntegrityError:
+                # Skip duplicates (if any)
+                continue
+        db.commit()
 
-# ------------------- API routes -------------------
+# ------------------- API endpoints -------------------
 @app.route('/api/register', methods=['POST'])
 def register():
     data = request.get_json()
@@ -35,72 +85,104 @@ def register():
         if field not in data or not data[field].strip():
             return jsonify({'error': f'Missing or empty {field}'}), 400
 
-    registrations = load_data()
+    fullName = data['fullName'].strip()
+    state = data['state'].strip()
+    district = data['district'].strip()
+    village = data['village'].strip()
+    phone = data['phone'].strip()
 
-    # Auto‑generate registration number
-    max_id = 0
-    for reg in registrations:
-        reg_no = reg.get('citizenRegNo', '')
-        if reg_no.startswith('CIT-'):
-            try:
-                num = int(reg_no.split('-')[1])
-                if num > max_id:
-                    max_id = num
-            except:
-                pass
-    new_id = max_id + 1
-    citizen_reg_no = f"CIT-{new_id:04d}"
+    # Basic validation (phone digits only, length 10)
+    if not phone.isdigit() or len(phone) != 10:
+        return jsonify({'error': 'Phone must be 10 digits'}), 400
 
-    registration = {
-        'id': new_id,
-        'citizenRegNo': citizen_reg_no,
-        'fullName': data['fullName'].strip(),
-        'state': data['state'].strip(),
-        'district': data['district'].strip(),
-        'village': data['village'].strip(),
-        'phone': data['phone'].strip(),
+    # Generate registration number
+    with closing(get_db()) as db:
+        # Find max numeric part from existing records
+        max_id = db.execute('SELECT MAX(CAST(SUBSTR(citizenRegNo, 5) AS INTEGER)) FROM citizens').fetchone()[0]
+        new_id = (max_id or 0) + 1
+        citizenRegNo = f"CIT-{new_id:04d}"
+
+        # Insert new record
+        try:
+            db.execute('''
+                INSERT INTO citizens (citizenRegNo, fullName, state, district, village, phone, createdAt)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (citizenRegNo, fullName, state, district, village, phone, datetime.utcnow().isoformat() + 'Z'))
+            db.commit()
+            # Get the auto-generated ID
+            reg_id = db.lastrowid
+        except sqlite3.IntegrityError as e:
+            if 'UNIQUE constraint failed: citizens.phone' in str(e):
+                return jsonify({'error': 'Phone number already registered'}), 400
+            return jsonify({'error': 'Duplicate registration number'}), 400
+
+    # Return the newly created record
+    new_reg = {
+        'id': reg_id,
+        'citizenRegNo': citizenRegNo,
+        'fullName': fullName,
+        'state': state,
+        'district': district,
+        'village': village,
+        'phone': phone,
         'createdAt': datetime.utcnow().isoformat() + 'Z'
     }
-
-    registrations.append(registration)
-    save_data(registrations)
-    return jsonify(registration), 201
+    return jsonify(new_reg), 201
 
 @app.route('/api/registrations', methods=['GET'])
 def get_all():
-    return jsonify(load_data())
+    with closing(get_db()) as db:
+        rows = db.execute('SELECT * FROM citizens ORDER BY id').fetchall()
+        result = [dict(row) for row in rows]
+    return jsonify(result)
 
 @app.route('/api/registrations/<int:reg_id>', methods=['PUT'])
 def update_registration(reg_id):
-    registrations = load_data()
-    for idx, reg in enumerate(registrations):
-        if reg.get('id') == reg_id:
-            updates = request.get_json()
-            reg['fullName'] = updates.get('fullName', reg['fullName']).strip()
-            reg['state'] = updates.get('state', reg['state']).strip()
-            reg['district'] = updates.get('district', reg['district']).strip()
-            reg['village'] = updates.get('village', reg['village']).strip()
-            reg['phone'] = updates.get('phone', reg['phone']).strip()
-            registrations[idx] = reg
-            save_data(registrations)
-            return jsonify(reg)
-    return jsonify({'error': 'Registration not found'}), 404
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'No data provided'}), 400
+
+    fullName = data.get('fullName', '').strip()
+    state = data.get('state', '').strip()
+    district = data.get('district', '').strip()
+    village = data.get('village', '').strip()
+    phone = data.get('phone', '').strip()
+
+    if not all([fullName, state, district, village, phone]):
+        return jsonify({'error': 'All fields are required'}), 400
+
+    with closing(get_db()) as db:
+        # Check if record exists
+        existing = db.execute('SELECT * FROM citizens WHERE id = ?', (reg_id,)).fetchone()
+        if not existing:
+            return jsonify({'error': 'Registration not found'}), 404
+
+        # Try to update (phone uniqueness is enforced by SQLite)
+        try:
+            db.execute('''
+                UPDATE citizens
+                SET fullName = ?, state = ?, district = ?, village = ?, phone = ?
+                WHERE id = ?
+            ''', (fullName, state, district, village, phone, reg_id))
+            db.commit()
+            # Fetch the updated row
+            updated = db.execute('SELECT * FROM citizens WHERE id = ?', (reg_id,)).fetchone()
+            return jsonify(dict(updated))
+        except sqlite3.IntegrityError:
+            return jsonify({'error': 'Phone number already used by another record'}), 400
 
 @app.route('/api/registrations/<int:reg_id>', methods=['DELETE'])
 def delete_registration(reg_id):
-    registrations = load_data()
-    new_list = [reg for reg in registrations if reg.get('id') != reg_id]
-    if len(new_list) == len(registrations):
-        return jsonify({'error': 'Registration not found'}), 404
-    save_data(new_list)
+    with closing(get_db()) as db:
+        db.execute('DELETE FROM citizens WHERE id = ?', (reg_id,))
+        if db.total_changes == 0:
+            return jsonify({'error': 'Registration not found'}), 404
+        db.commit()
     return jsonify({'message': 'Deleted'}), 200
 
-# ------------------- (Optional) Portal served by Flask -------------------
-# If you prefer to host the portal on Flask instead of Blogger, uncomment:
-# @app.route('/')
-# def portal():
-#     return render_template('portal.html')
+# ------------------- Initialization -------------------
+init_db()
+migrate_json_to_sqlite()
 
-# For PythonAnywhere, the app must be named 'app'
 if __name__ == '__main__':
     app.run(debug=True)
